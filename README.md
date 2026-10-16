@@ -1,89 +1,81 @@
 # Hasgier
 
-A Gleam server integrating ShipStation, QuickBooks, and WooCommerce for accounting automation.
+A Go server integrating ShipStation, QuickBooks, and WooCommerce for accounting automation.
 
 ## Architecture
 
 ```
-webhook_handler.gleam      # Wisp handler: verify → 202 → bg_jobs.enqueue
+webhook/router.go        # chi router: verify → 202 → river enqueue
 workers/
-  woo_order_worker.gleam    # bg_jobs worker: map WooCommerce order → QB invoice
-  shipstation_worker.gleam  # bg_jobs worker: update QB with tracking
+  woo_order.go           # river worker: map WooCommerce order → QB invoice
+  shipstation.go         # river worker: update QB with tracking
 integrations/
-  woocommerce.gleam         # REST client wrapper
-  shipstation.gleam         # REST client wrapper
-  quickbooks.gleam          # OAuth2 + REST client wrapper
+  woocommerce/client.go  # REST client wrapper
+  shipstation/client.go  # REST client wrapper
+  quickbooks/
+    client.go            # REST client wrapper
+    oauth.go             # OAuth2 flow + token management
 db/
-  schema/                   # squirrel-generated query functions
-  migrations/               # cigogne SQL migrations
-main.gleam                  # Supervisor: pog pool + bg_jobs + wisp server
+  pool.go                # pgx pool setup
+  migrations/            # golang-migrate SQL migrations
+  queries/               # hand-written or sqlc-generated queries
+main.go                  # pgx pool + river + chi server
 ```
 
-Supervision tree: `application_supervisor` starts `pog` pool, `bg_jobs` queues, and `wisp` HTTP server. If any crash, OTP restarts them. No single point of failure.
+## Stack
 
-## Dependencies
-
-```toml
-wisp = "~> 2.2"
-gleam_httpc = "~> 5.0"
-gleam_http = "~> 4.3"
-pog = "~> 4.1"
-bg_jobs = "~> 0.5"
-flwr_oauth2 = "~> 3.0"
-gleam_crypto = "~> 1.6"
-cigogne = "~> 5"
-envoy = "~> 1"
-gleam_json = "~> 2"
-gleam_erlang = "~> 1"
-gleam_otp = "~> 1"
-gleam_stdlib = "~> 0.52"
-squirrel = "~> 4"              # dev dependency
-```
+| Need | Package |
+|---|---|
+| Web framework | `chi` |
+| HTTP client | stdlib `net/http` |
+| Postgres driver | `pgx` |
+| Job queue | `river` (Postgres-backed) |
+| Migrations | `golang-migrate` |
+| OAuth2 | `golang.org/x/oauth2` |
+| JSON | stdlib `encoding/json` |
+| Config | stdlib `os.Getenv` |
 
 ## File Structure
 
 ```
 hasgier/
-├── gleam.toml
-├── manifest.toml
+├── go.mod
+├── go.sum
 ├── Dockerfile
 ├── .env.example
-├── priv/
-│   ├── migrations/
-│   │   └── 001_initial_schema.sql
-│   └── cigogne.toml
-└── src/
-    ├── hasgier.gleam                # supervisor + main
-    ├── config.gleam                 # env var reading
-    ├── sql/                         # squirrel .sql files
-    │   ├── create_mapping.sql
-    │   ├── update_sync_state.sql
-    │   ├── find_idem_key.sql
-    │   ├── insert_idem_key.sql
-    │   ├── upsert_token.sql
-    │   └── get_token.sql
-    ├── sql.gleam                    # squirrel-generated
-    ├── webhook.gleam                # webhook router + verification
+├── cmd/
+│   └── hasgier/
+│       └── main.go
+└── internal/
+    ├── config/
+    │   └── config.go
     ├── db/
-    │   └── pool.gleam               # pog pool child spec
+    │   ├── pool.go
+    │   ├── migrations/
+    │   │   └── 001_initial_schema.up.sql
+    │   └── queries/
+    │       ├── idempotency.go
+    │       ├── tokens.go
+    │       ├── mappings.go
+    │       └── sync_state.go
+    ├── integrations/
+    │   ├── woocommerce/
+    │   │   └── client.go
+    │   ├── shipstation/
+    │   │   └── client.go
+    │   └── quickbooks/
+    │       ├── client.go
+    │       └── oauth.go
     ├── workers/
-    │   ├── woo_order.gleam          # bg_jobs worker
-    │   └── shipstation.gleam        # bg_jobs worker
-    └── integrations/
-        ├── woocommerce.gleam        # REST client
-        ├── shipstation.gleam        # REST client
-        └── quickbooks.gleam         # OAuth2 + REST client
+    │   ├── woo_order.go
+    │   └── shipstation.go
+    └── webhook/
+        └── router.go
 ```
 
-## Implementation Plan
+## Database Schema
 
-### Phase 1: Project Scaffolding
-
-Create project with `gleam new hasgier`, add dependencies, set up Dockerfile and `.env.example`.
-
-### Phase 2: Database Schema
-
-**`priv/migrations/001_initial_schema.sql`** — four tables:
+**`internal/db/migrations/001_initial_schema.up.sql`**:
 
 ```sql
 -- idempotency: prevent duplicate webhook processing
@@ -128,112 +120,112 @@ CREATE TABLE sync_state (
 );
 ```
 
-Squirrel `.sql` files each contain a single query that squirrel turns into a typed Gleam function.
+## Config
 
-### Phase 3: Config Module
+**`internal/config/config.go`** — reads from env vars:
 
-**`src/config.gleam`** — reads from `envoy`:
-
-```gleam
-pub type Config {
-  Config(
-    port: Int,
-    database_url: String,
-    woo_url: String,
-    woo_consumer_key: String,
-    woo_consumer_secret: String,
-    woo_webhook_secret: String,
-    shipstation_api_key: String,
-    shipstation_api_secret: String,
-    qb_client_id: String,
-    qb_client_secret: String,
-    qb_redirect_uri: String,
-    qb_environment: String,
-  )
+```go
+type Config struct {
+    Port                 int
+    DatabaseURL          string
+    WooURL               string
+    WooConsumerKey       string
+    WooConsumerSecret    string
+    WooWebhookSecret     string
+    ShipStationAPIKey    string
+    ShipStationAPISecret string
+    QBClientID           string
+    QBClientSecret       string
+    QBRedirectURI        string
+    QBEnvironment        string // "sandbox" | "production"
 }
 ```
 
-### Phase 4: API Clients
+## API Clients
 
-#### `src/integrations/woocommerce.gleam`
+### `internal/integrations/woocommerce/client.go`
 
-~150 lines. REST wrapper for `https://{store}/wp-json/wc/v3/`. Uses consumer key/secret as query params or Basic Auth.
+REST wrapper for `https://{store}/wp-json/wc/v3/`. Uses consumer key/secret as query params or Basic Auth.
 
-```gleam
-fn get_order(conn: Connection, id: Int) -> Result(Dynamic, ApiError)
-fn update_order(conn: Connection, id: Int, data: Dynamic) -> Result(Dynamic, ApiError)
-fn list_orders(conn: Connection, params: List(#(String, String))) -> Result(List(Dynamic), ApiError)
+```go
+func (c *Client) GetOrder(ctx context.Context, id int) (*Order, error)
+func (c *Client) UpdateOrder(ctx context.Context, id int, data Order) (*Order, error)
+func (c *Client) ListOrders(ctx context.Context, params url.Values) ([]Order, error)
 ```
 
-#### `src/integrations/shipstation.gleam`
+### `internal/integrations/shipstation/client.go`
 
-~100 lines. REST wrapper for `https://ssapi.shipstation.com/`. Uses Basic Auth (API key + API secret).
+REST wrapper for `https://ssapi.shipstation.com/`. Uses Basic Auth.
 
-```gleam
-fn get_shipment(conn: Connection, shipment_id: Int) -> Result(Dynamic, ApiError)
-fn list_orders(conn: Connection, params: Dict(String, String)) -> Result(List(Dynamic), ApiError)
+```go
+func (c *Client) GetShipment(ctx context.Context, shipmentID int) (*Shipment, error)
+func (c *Client) ListOrders(ctx context.Context, params url.Values) ([]Order, error)
 ```
 
-#### `src/integrations/quickbooks.gleam`
+### `internal/integrations/quickbooks/oauth.go`
 
-~250 lines. The heaviest module. Two parts:
+OAuth2 flow using `golang.org/x/oauth2`:
+- `GetAuthorizationURL()` — builds the Intuit authorize URL
+- `ExchangeCode(code, realmID)` — exchanges authorization code for tokens, stores to DB
+- `RefreshToken()` — uses refresh token, updates DB
+- `GetValidToken()` — returns current access token, refreshes if expired
 
-**Part A — OAuth2** (using `flwr_oauth2`):
-- `fn get_authorization_url() -> String` — builds the Intuit authorize URL with scopes
-- `fn exchange_code(code: String, realm_id: String) -> Result(TokenData, ApiError)` — exchanges authorization code for tokens, stores to DB
-- `fn refresh_token() -> Result(TokenData, ApiError)` — uses refresh token, updates DB
-- `fn get_valid_token() -> Result(String, ApiError)` — returns current access token, refreshes if expired
+### `internal/integrations/quickbooks/client.go`
 
-**Part B — REST API**:
-```gleam
-fn create_invoice(conn: Connection, invoice_data: Json) -> Result(Dynamic, ApiError)
-fn create_payment(conn: Connection, payment_data: Json) -> Result(Dynamic, ApiError)
-fn query(conn: Connection, query: String) -> Result(Dynamic, ApiError)
-fn find_customer(conn: Connection, email: String) -> Result(Dynamic, ApiError)
-fn create_customer(conn: Connection, customer_data: Json) -> Result(Dynamic, ApiError)
+REST API wrapper for QuickBooks Online:
+
+```go
+func (c *Client) CreateInvoice(ctx context.Context, invoice *Invoice) (*Invoice, error)
+func (c *Client) CreatePayment(ctx context.Context, payment *Payment) (*Payment, error)
+func (c *Client) Query(ctx context.Context, query string) ([]byte, error)
+func (c *Client) FindCustomer(ctx context.Context, email string) (*Customer, error)
+func (c *Client) CreateCustomer(ctx context.Context, customer *Customer) (*Customer, error)
 ```
 
-All QB requests include `Authorization: Bearer {token}` and `Accept: application/json`. Token refresh is transparent via a middleware pattern.
+All QB requests include `Authorization: Bearer {token}` and `Accept: application/json`. Token refresh is transparent.
 
-### Phase 5: Webhook Router
+## Webhook Router
 
-**`src/webhook.gleam`** — ~150 lines. Handles all three webhook sources.
+**`internal/webhook/router.go`** — chi routes:
 
-```gleam
-fn handle_request(req: Request, ctx: Context) -> Response {
-  case req.method, req.path {
-    Post, "/webhooks/woocommerce" -> handle_woo_webhook(req, ctx)
-    Post, "/webhooks/shipstation" -> handle_ss_webhook(req, ctx)
-    Get, "/oauth/qb/callback" -> handle_qb_callback(req, ctx)
-    Get, "/oauth/qb/authorize" -> handle_qb_authorize(ctx)
-    _, _ -> wisp.not_found()
-  }
+```go
+func Router(cfg *config.Config, pool *pgxpool.Pool, river *river.Client) *chi.Mux {
+    r := chi.NewRouter()
+
+    r.Post("/webhooks/woocommerce", handleWooWebhook(cfg, pool, river))
+    r.Post("/webhooks/shipstation", handleSSWebhook(cfg, pool, river))
+    r.Get("/oauth/qb/callback", handleQBCallback(cfg, pool))
+    r.Get("/oauth/qb/authorize", handleQBAuthorize(cfg))
+
+    return r
 }
 ```
 
-**WooCommerce webhook handler:**
-1. Read raw body as `BitArray` (`wisp.read_body_bits`)
+### WooCommerce webhook handler
+
+1. Read raw body bytes
 2. Get `X-WC-Webhook-Signature` header
-3. Compute `gleam_crypto.hmac(body, Sha256, webhook_secret) |> bit_array.base16_encode`
-4. Constant-time compare with signature → return 401 on mismatch
+3. Compute HMAC-SHA256 of body with webhook secret
+4. Constant-time compare with signature → 401 on mismatch
 5. Insert idempotency key → skip if duplicate
 6. Return `202 Accepted` immediately
-7. `bg_jobs.enqueue("woo_order_worker", payload)`
+7. `river.Enqueue("woo_order_worker", payload)`
 
-**ShipStation webhook handler:**
+### ShipStation webhook handler
+
 1. Verify Basic Auth header matches configured API credentials
-2. Read raw body as `BitArray`
-3. Decompress with Erlang's `:zlib.gunzip` (via `gleam_erlang` FFI)
+2. Read raw body bytes
+3. Decompress with `compress/gzip`
 4. Parse JSON, check `X-ShipStation-Event` header
 5. Insert idempotency key → skip if duplicate
 6. Return `200 OK` immediately
-7. `bg_jobs.enqueue("shipstation_worker", payload)`
+7. `river.Enqueue("shipstation_worker", payload)`
 
-### Phase 6: Background Workers
+## Background Workers
 
-#### `src/workers/woo_order.gleam`
+### `internal/workers/woo_order.go`
 
-~100 lines. Triggers on `order.created` and `order.updated` webhooks.
+Triggers on `order.created` and `order.updated` webhooks:
 
 1. Extract order from webhook payload
 2. Find or create QuickBooks customer by email
@@ -244,83 +236,80 @@ fn handle_request(req: Request, ctx: Context) -> Response {
 7. If order is paid, POST payment to QuickBooks
 8. Upsert sync_state row with status `synced` + qb_invoice_id
 
-#### `src/workers/shipstation.gleam`
+### `internal/workers/shipstation.go`
 
-~100 lines. Triggers on `SHIP_NOTIFY` and `ITEM_SHIP_NOTIFY`.
+Triggers on `SHIP_NOTIFY` and `ITEM_SHIP_NOTIFY`:
 
 1. Extract shipment details + tracking number
-2. Look up sync_state by order number (WooCommerce order number)
+2. Look up sync_state by order number
 3. Fetch the QB invoice via qb_invoice_id
 4. Update invoice with tracking info (ship date, carrier, tracking #)
 5. Update sync_state with tracking_number and status
 
-### Phase 7: Main Application
+## Main Application
 
-**`src/hasgier.gleam`** — ~80 lines. Sets up the OTP supervision tree:
+**`cmd/hasgier/main.go`**:
 
-```gleam
-pub fn main() {
-  let config = config.load()
+1. Load config from env
+2. Run golang-migrate migrations
+3. Start pgx connection pool
+4. Register river workers
+5. Start chi HTTP server
+6. Graceful shutdown on SIGTERM
 
-  // 1. Start pog database pool (supervised)
-  // 2. Ensure cigogne migrations are applied
-  // 3. Start bg_jobs with queues + workers
-  // 4. Start Wisp HTTP server on config.port
-}
+## Deployment
+
+**`Dockerfile`** — two-stage build:
+
+```dockerfile
+FROM golang:1.26-alpine AS build
+WORKDIR /app
+COPY . .
+RUN go build -o bin/hasgier ./cmd/hasgier
+
+FROM alpine:latest
+RUN apk add --no-cache ca-certificates
+WORKDIR /app
+COPY --from=build /app/bin/hasgier .
+EXPOSE 8080
+CMD ["./hasgier"]
 ```
 
-The supervision tree:
-```
-application_supervisor (OneForOne)
-├── pog pool (permanent)
-├── bg_jobs supervisor
-│   ├── "default" queue
-│   │   ├── woo_order_worker
-│   │   └── shipstation_worker
-│   └── monitor
-└── Wisp/Mist HTTP server
-```
-
-### Phase 8: Deployment
-
-Dockerfile builds to an ~80MB image. Fly.io deployment:
+Fly.io deployment:
 
 ```bash
-fly launch --build-only            # creates fly.toml
-fly pg create --name hasgier-db    # managed Postgres
-fly secrets set ...                # all API keys/tokens
+fly launch --build-only
+fly pg create --name hasgier-db
+fly secrets set ...
 fly deploy
 ```
-
-`fly.toml` auto-detected, just configure port 8080 and attach Postgres.
 
 ## Build Order
 
 | Step | Files | Effort | Depends on |
 |---|---|---|---|
-| 1. Project scaffold | `gleam new`, `gleam.toml` | 5 min | nothing |
-| 2. DB schema + cigogne | 001 migration, cigogne.toml | 15 min | step 1 |
-| 3. Config module | `config.gleam` | 10 min | step 1 |
-| 4. DB pool | `db/pool.gleam` | 10 min | steps 1-2 |
-| 5. WooCommerce client | `integrations/woocommerce.gleam` | 30 min | step 3 |
-| 6. ShipStation client | `integrations/shipstation.gleam` | 20 min | step 3 |
-| 7. QuickBooks client | `integrations/quickbooks.gleam` | 60 min | steps 3-4 |
-| 8. Webhook router | `webhook.gleam` | 40 min | steps 4-7 |
-| 9. BG workers | `workers/*.gleam` | 30 min | steps 4-7 |
-| 10. Main + supervisor | `hasgier.gleam` | 20 min | steps 4-9 |
+| 1. Project scaffold | `go mod init`, directory structure | 5 min | nothing |
+| 2. DB schema + migrations | migration SQL | 15 min | step 1 |
+| 3. Config module | `config.go` | 10 min | step 1 |
+| 4. DB pool + queries | `pool.go`, `queries/*.go` | 20 min | steps 1-2 |
+| 5. WooCommerce client | `woocommerce/client.go` | 30 min | step 3 |
+| 6. ShipStation client | `shipstation/client.go` | 20 min | step 3 |
+| 7. QuickBooks client | `quickbooks/*.go` | 60 min | steps 3-4 |
+| 8. Webhook router | `webhook/router.go` | 40 min | steps 4-7 |
+| 9. BG workers | `workers/*.go` | 30 min | steps 4-7 |
+| 10. Main | `main.go` | 15 min | steps 4-9 |
 | 11. Dockerfile | `Dockerfile` | 10 min | step 10 |
-| 12. Squirrel SQL files | `sql/*.sql` | 15 min | step 2 |
 
-Total build time: ~4-5 hours for a working MVP.
+Total build time: ~4 hours for a working MVP.
 
 ## Gotchas
 
-1. **ShipStation gzip**: The `:zlib.gunzip` FFI call is the one slightly awkward piece. Use `gleam_erlang` to call `:zlib.gunzip` directly.
+1. **ShipStation gzip**: Use stdlib `compress/gzip` — straightforward, no FFI needed.
 
-2. **QuickBooks token refresh**: Must be atomic — store an `expires_at` 5 minutes before actual expiry and refresh early to avoid race conditions between workers.
+2. **QuickBooks token refresh**: Must be atomic — store `expires_at` 5 minutes before actual expiry and refresh early to avoid race conditions between workers.
 
-3. **Webhook body double-read**: Wisp's `require_string_body` can only be called once per request. For WooCommerce you need the raw `BitArray` (for HMAC) AND the parsed JSON (for the payload). Read once as bits, store, then parse.
+3. **Webhook body double-read**: For WooCommerce you need the raw bytes (for HMAC) AND the parsed JSON. Read once as bytes, store, then parse.
 
-4. **WooCommerce HMAC comparison**: Use constant-time comparison. Fall back to Erlang's `:crypto` if `gleam_crypto` doesn't expose it.
+4. **WooCommerce HMAC comparison**: Use `crypto/hmac` + `crypto/sha256` + `crypto/subtle.ConstantTimeCompare`.
 
-5. **bg_jobs is pre-1.0**: Test thoroughly. The API is stable enough but edge cases may exist.
+5. **River job queue**: Uses `FOR UPDATE SKIP LOCKED` for job fetching. Tables are auto-created by river migrations.
