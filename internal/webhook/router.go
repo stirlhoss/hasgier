@@ -19,13 +19,16 @@ import (
 
 	"hasgier/internal/config"
 	"hasgier/internal/db/queries"
+	"hasgier/internal/integrations/quickbooks"
 	"hasgier/internal/workers"
 )
 
 type Context struct {
-	Config    *config.Config
-	Pool      *pgxpool.Pool
-	River     *river.Client[pgx.Tx]
+	Config      *config.Config
+	Pool        *pgxpool.Pool
+	River       *river.Client[pgx.Tx]
+	QBOAuth     *quickbooks.OAuthConfig
+	QBTokenMgr  *quickbooks.TokenManager
 }
 
 func Router(ctx *Context) *chi.Mux {
@@ -36,8 +39,8 @@ func Router(ctx *Context) *chi.Mux {
 
 	r.Post("/webhooks/woocommerce", ctx.handleWooWebhook)
 	r.Post("/webhooks/shipstation", ctx.handleSSWebhook)
-	r.Get("/oauth/qb/callback", ctx.handleQBCallback)
 	r.Get("/oauth/qb/authorize", ctx.handleQBAuthorize)
+	r.Get("/oauth/qb/callback", ctx.handleQBCallback)
 
 	return r
 }
@@ -84,7 +87,6 @@ func (c *Context) handleWooWebhook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Enqueue job
 	payload := map[string]interface{}{
 		"topic": topic,
 		"body":  json.RawMessage(body),
@@ -101,14 +103,12 @@ func (c *Context) handleWooWebhook(w http.ResponseWriter, r *http.Request) {
 // handleSSWebhook handles ShipStation webhook events.
 // Verifies Basic Auth, decompresses gzip, checks idempotency, enqueues job.
 func (c *Context) handleSSWebhook(w http.ResponseWriter, r *http.Request) {
-	// Verify Basic Auth
 	username, password, ok := r.BasicAuth()
 	if !ok || username != c.Config.ShipStationAPIKey || password != c.Config.ShipStationAPISecret {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
 
-	// Read and decompress body
 	compressedBody, err := io.ReadAll(r.Body)
 	if err != nil {
 		http.Error(w, "failed to read body", http.StatusBadRequest)
@@ -150,7 +150,6 @@ func (c *Context) handleSSWebhook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Enqueue job
 	payload := map[string]interface{}{
 		"event": event,
 		"body":  json.RawMessage(body),
@@ -166,13 +165,35 @@ func (c *Context) handleSSWebhook(w http.ResponseWriter, r *http.Request) {
 
 // handleQBAuthorize redirects the user to Intuit's OAuth2 authorization page.
 func (c *Context) handleQBAuthorize(w http.ResponseWriter, r *http.Request) {
-	// TODO: generate authorization URL and redirect
-	w.WriteHeader(http.StatusNotImplemented)
-	json.NewEncoder(w).Encode(map[string]string{"error": "not implemented"})
+	state, err := quickbooks.GenerateState()
+	if err != nil {
+		http.Error(w, "failed to generate state", http.StatusInternalServerError)
+		return
+	}
+
+	quickbooks.SetStateCookie(w, state)
+
+	authURL := c.QBOAuth.GetAuthorizationURL(state)
+	http.Redirect(w, r, authURL, http.StatusFound)
 }
 
 // handleQBCallback handles the OAuth2 callback from Intuit.
+// Exchanges the authorization code for tokens and stores them.
 func (c *Context) handleQBCallback(w http.ResponseWriter, r *http.Request) {
+	// Verify state for CSRF protection
+	stateCookie, err := quickbooks.GetStateCookie(r)
+	if err != nil {
+		http.Error(w, "missing state cookie", http.StatusBadRequest)
+		return
+	}
+	quickbooks.ClearStateCookie(w)
+
+	stateParam := r.URL.Query().Get("state")
+	if stateParam == "" || stateParam != stateCookie {
+		http.Error(w, "state mismatch", http.StatusBadRequest)
+		return
+	}
+
 	code := r.URL.Query().Get("code")
 	realmID := r.URL.Query().Get("realmId")
 	if code == "" || realmID == "" {
@@ -180,10 +201,22 @@ func (c *Context) handleQBCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// TODO: exchange code for tokens, store in DB
-	_ = code
-	_ = realmID
+	// Exchange authorization code for tokens
+	token, err := c.QBOAuth.ExchangeCode(r.Context(), code)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("token exchange failed: %v", err), http.StatusInternalServerError)
+		return
+	}
 
-	w.WriteHeader(http.StatusNotImplemented)
-	json.NewEncoder(w).Encode(map[string]string{"error": "not implemented"})
+	// Store tokens in database
+	if err := c.QBTokenMgr.StoreTokens(r.Context(), token, realmID); err != nil {
+		http.Error(w, fmt.Sprintf("failed to store tokens: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{
+		"status":   "connected",
+		"realm_id": realmID,
+	})
 }

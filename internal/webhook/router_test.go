@@ -16,6 +16,7 @@ import (
 	"github.com/riverqueue/river/riverdriver/riverpgxv5"
 
 	"hasgier/internal/config"
+	"hasgier/internal/integrations/quickbooks"
 	"hasgier/internal/testutil"
 	"hasgier/internal/workers"
 )
@@ -52,10 +53,20 @@ func setupTestContext(t *testing.T) *Context {
 		t.Fatalf("create river client: %v", err)
 	}
 
+	qbOAuth := &quickbooks.OAuthConfig{
+		ClientID:     cfg.QBClientID,
+		ClientSecret: cfg.QBClientSecret,
+		RedirectURI:  cfg.QBRedirectURI,
+		Environment:  cfg.QBEnvironment,
+	}
+	qbTokenMgr := quickbooks.NewTokenManager(qbOAuth, db.Pool)
+
 	return &Context{
-		Config: cfg,
-		Pool:   db.Pool,
-		River:  riverClient,
+		Config:     cfg,
+		Pool:       db.Pool,
+		River:      riverClient,
+		QBOAuth:    qbOAuth,
+		QBTokenMgr: qbTokenMgr,
 	}
 }
 
@@ -203,6 +214,81 @@ func TestSSWebhook_InvalidAuth(t *testing.T) {
 
 	if w.Code != http.StatusUnauthorized {
 		t.Errorf("status = %d, want %d", w.Code, http.StatusUnauthorized)
+	}
+}
+
+func TestQBAuthorize_Redirects(t *testing.T) {
+	ctx := setupTestContext(t)
+
+	req := httptest.NewRequest(http.MethodGet, "/oauth/qb/authorize", nil)
+	w := httptest.NewRecorder()
+	ctx.handleQBAuthorize(w, req)
+
+	if w.Code != http.StatusFound {
+		t.Errorf("status = %d, want %d", w.Code, http.StatusFound)
+	}
+
+	location := w.Header().Get("Location")
+	if location == "" {
+		t.Error("missing Location header")
+	}
+	if !bytes.Contains([]byte(location), []byte("appcenter.intuit.com")) {
+		t.Errorf("Location missing Intuit domain: %s", location)
+	}
+	if !bytes.Contains([]byte(location), []byte("client_id=qb_id")) {
+		t.Errorf("Location missing client_id: %s", location)
+	}
+
+	// Should have state cookie
+	cookies := w.Result().Cookies()
+	var stateCookie *http.Cookie
+	for _, c := range cookies {
+		if c.Name == "qb_oauth_state" {
+			stateCookie = c
+		}
+	}
+	if stateCookie == nil {
+		t.Error("missing state cookie")
+	}
+}
+
+func TestQBCallback_MissingParams(t *testing.T) {
+	ctx := setupTestContext(t)
+
+	req := httptest.NewRequest(http.MethodGet, "/oauth/qb/callback", nil)
+	w := httptest.NewRecorder()
+	ctx.handleQBCallback(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want %d", w.Code, http.StatusBadRequest)
+	}
+}
+
+func TestQBCallback_StateMismatch(t *testing.T) {
+	ctx := setupTestContext(t)
+
+	req := httptest.NewRequest(http.MethodGet, "/oauth/qb/callback?code=test&realmId=123&state=wrong", nil)
+	req.AddCookie(&http.Cookie{Name: "qb_oauth_state", Value: "correct-state"})
+
+	w := httptest.NewRecorder()
+	ctx.handleQBCallback(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want %d", w.Code, http.StatusBadRequest)
+	}
+}
+
+func TestQBCallback_MissingCookie(t *testing.T) {
+	ctx := setupTestContext(t)
+
+	req := httptest.NewRequest(http.MethodGet, "/oauth/qb/callback?code=test&realmId=123&state=test", nil)
+	// No cookie set
+
+	w := httptest.NewRecorder()
+	ctx.handleQBCallback(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want %d", w.Code, http.StatusBadRequest)
 	}
 }
 

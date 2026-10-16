@@ -41,7 +41,7 @@ func run() error {
 		return fmt.Errorf("load config: %w", err)
 	}
 
-	// Run migrations
+	// Run app migrations
 	m, err := migrate.New("file://internal/db/migrations", cfg.DatabaseURL)
 	if err != nil {
 		return fmt.Errorf("create migrator: %w", err)
@@ -70,17 +70,19 @@ func run() error {
 	// Create integration clients
 	wooClient := woocommerce.NewClient(cfg.WooURL, cfg.WooConsumerKey, cfg.WooConsumerSecret)
 	ssClient := shipstation.NewClient(cfg.ShipStationAPIKey, cfg.ShipStationAPISecret)
+
+	// QuickBooks OAuth config and token manager
 	qbOAuth := &quickbooks.OAuthConfig{
 		ClientID:     cfg.QBClientID,
 		ClientSecret: cfg.QBClientSecret,
 		RedirectURI:  cfg.QBRedirectURI,
 		Environment:  cfg.QBEnvironment,
 	}
+	qbTokenMgr := quickbooks.NewTokenManager(qbOAuth, pool)
 
 	// Create QB client with token provider
 	qbClient := quickbooks.NewClient(qbOAuth, func(ctx context.Context) (string, error) {
-		// TODO: implement token refresh logic
-		return "", fmt.Errorf("not implemented")
+		return qbTokenMgr.GetValidToken(ctx, "")
 	}, "")
 
 	_ = wooClient
@@ -89,9 +91,11 @@ func run() error {
 
 	// Create webhook context
 	webhookCtx := &webhook.Context{
-		Config: cfg,
-		Pool:   pool,
-		River:  riverClient,
+		Config:     cfg,
+		Pool:       pool,
+		River:      riverClient,
+		QBOAuth:    qbOAuth,
+		QBTokenMgr: qbTokenMgr,
 	}
 
 	// Create HTTP server
